@@ -221,6 +221,17 @@ const emailVerificationTokenSchema = new Schema(
   baseOptions,
 );
 
+const otpTokenSchema = new Schema(
+  {
+    otp_hash: { type: String, unique: true, required: true, index: true },
+    user_id: { type: String, required: true, index: true },
+    expires_at: { type: Date, required: true, index: { expires: 0 } },
+    used_at: { type: Date, default: null },
+  },
+  baseOptions,
+);
+
+export const OtpToken = models.OtpToken || model('OtpToken', otpTokenSchema);
 export const User = models.User || model('User', userSchema);
 export const Follow = models.Follow || model('Follow', followSchema);
 export const Post = models.Post || model('Post', postSchema);

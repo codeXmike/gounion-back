@@ -1,13 +1,16 @@
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import { Router } from 'express';
-import { EmailVerificationToken, Follow, Post, User } from '../models.js';
+import { EmailVerificationToken, Follow, OtpToken, Post, User } from '../models.js';
 import { addNotification, publicUser, serializePost } from '../store.js';
 import { env } from '../config/env.js';
 import { requireAuth } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { HttpError, notFound } from '../utils/httpError.js';
-import { sendWelcomeEmail } from '../services/mail.js';
-import { createOpaqueToken, hashOpaqueToken } from '../services/tokens.js';
+import { sendOtpEmail } from '../services/mail.js';
+
+const generateOtp = () => String(Math.floor(100000 + Math.random() * 900000));
+const hashOtp = (otp) => crypto.createHash('sha256').update(otp).digest('hex');
 
 export const usersRouter = Router();
 
@@ -30,13 +33,15 @@ usersRouter.post(
     user.profile.user_id = user.id;
     await user.save();
 
-    const token = createOpaqueToken();
-    await EmailVerificationToken.create({
-      token_hash: hashOpaqueToken(token),
+    // Issue OTP for email verification
+    await OtpToken.deleteMany({ user_id: user.id, used_at: null });
+    const otp = generateOtp();
+    await OtpToken.create({
+      otp_hash: hashOtp(otp),
       user_id: user.id,
-      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      expires_at: new Date(Date.now() + 15 * 60 * 1000),
     });
-    await sendWelcomeEmail(user, `${env.appUrl}/confirm-email?token=${token}&email=${encodeURIComponent(user.email)}`);
+    await sendOtpEmail(user, otp);
 
     res.status(201).json(await publicUser(user));
   }),

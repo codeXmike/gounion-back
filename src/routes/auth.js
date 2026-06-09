@@ -1,18 +1,21 @@
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import multer from 'multer';
 import { Router } from 'express';
-import { EmailVerificationToken, PasswordResetToken, RefreshToken, User } from '../models.js';
+import { EmailVerificationToken, OtpToken, PasswordResetToken, RefreshToken, User } from '../models.js';
 import { env } from '../config/env.js';
 import { publicUser } from '../store.js';
 import { requireAuth } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { HttpError, unauthorized } from '../utils/httpError.js';
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/tokens.js';
-import { sendPasswordResetEmail } from '../services/mail.js';
+import { sendOtpEmail, sendPasswordResetEmail } from '../services/mail.js';
 import { createOpaqueToken, hashOpaqueToken } from '../services/tokens.js';
 
 const form = multer();
 export const authRouter = Router();
+
+// ── helpers ────────────────────────────────────────────────────────────────
 
 const issueTokens = async (user) => {
   const access_token = signAccessToken(user);
@@ -20,6 +23,23 @@ const issueTokens = async (user) => {
   await RefreshToken.create({ token: refresh_token, user_id: user.id });
   return { access_token, refresh_token, token_type: 'bearer' };
 };
+
+const generateOtp = () => String(Math.floor(100000 + Math.random() * 900000));
+const hashOtp = (otp) => crypto.createHash('sha256').update(otp).digest('hex');
+
+/** Creates a fresh OTP, stores it, and emails it to the user. */
+const issueOtp = async (user) => {
+  await OtpToken.deleteMany({ user_id: user.id, used_at: null });
+  const otp = generateOtp();
+  await OtpToken.create({
+    otp_hash: hashOtp(otp),
+    user_id: user.id,
+    expires_at: new Date(Date.now() + 15 * 60 * 1000),
+  });
+  await sendOtpEmail(user, otp);
+};
+
+// ── routes ─────────────────────────────────────────────────────────────────
 
 authRouter.post(
   '/token',
@@ -29,6 +49,7 @@ authRouter.post(
     const user = await User.findOne({ $or: [{ email: emailOrUsername }, { username: req.body.username }] });
     if (!user || !(await bcrypt.compare(req.body.password || '', user.password_hash))) throw unauthorized('Incorrect username or password.');
     if (!user.is_active) throw new HttpError(403, 'Your account has been suspended.');
+    if (!user.email_verified) throw new HttpError(403, 'Verify your email address.');
     res.json(await issueTokens(user));
   }),
 );
@@ -97,6 +118,66 @@ authRouter.post(
   }),
 );
 
+/**
+ * POST /auth/verify-otp
+ * Body: { email, otp }
+ * Verifies the 6-digit OTP and marks the user's email as confirmed.
+ */
+authRouter.post(
+  '/verify-otp',
+  asyncHandler(async (req, res) => {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const otp = String(req.body.otp || '').trim();
+    if (!email) throw new HttpError(400, 'email is required.');
+    if (!otp) throw new HttpError(400, 'otp is required.');
+
+    const user = await User.findOne({ email });
+    if (!user) throw new HttpError(404, 'No account found with that email.');
+
+    if (user.email_verified) {
+      return res.json({ status: 'ok', message: 'Email already verified.' });
+    }
+
+    const otpRecord = await OtpToken.findOne({
+      otp_hash: hashOtp(otp),
+      user_id: user.id,
+      used_at: null,
+      expires_at: { $gt: new Date() },
+    });
+    if (!otpRecord) throw new HttpError(400, 'Invalid or expired code. Please try again.');
+
+    user.email_verified = true;
+    await user.save();
+    otpRecord.used_at = new Date();
+    await otpRecord.save();
+
+    res.json({ status: 'ok', message: 'Email verified.' });
+  }),
+);
+
+/**
+ * POST /auth/resend-otp
+ * Body: { email }
+ * Sends a fresh OTP to the given (unverified) email address.
+ */
+authRouter.post(
+  '/resend-otp',
+  asyncHandler(async (req, res) => {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    if (!email) throw new HttpError(400, 'email is required.');
+
+    const user = await User.findOne({ email });
+    // Respond the same way whether the user exists or not (no enumeration)
+    if (user && !user.email_verified) {
+      await issueOtp(user);
+    }
+
+    res.json({ status: 'ok', message: 'If the email is pending verification, a new code has been sent.' });
+  }),
+);
+
+// Keep the old confirm-email route for backwards-compatibility with any
+// magic-link emails that were sent before this migration.
 authRouter.post(
   '/confirm-email',
   asyncHandler(async (req, res) => {
