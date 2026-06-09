@@ -1,16 +1,13 @@
 import bcrypt from 'bcryptjs';
-import crypto from 'crypto';
 import { Router } from 'express';
-import { EmailVerificationToken, Follow, OtpToken, Post, User } from '../models.js';
+import { EmailVerificationToken, Follow, Post, User } from '../models.js';
 import { addNotification, publicUser, serializePost } from '../store.js';
 import { env } from '../config/env.js';
 import { requireAuth } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { HttpError, notFound } from '../utils/httpError.js';
-import { sendOtpEmail } from '../services/mail.js';
-
-const generateOtp = () => String(Math.floor(100000 + Math.random() * 900000));
-const hashOtp = (otp) => crypto.createHash('sha256').update(otp).digest('hex');
+import { sendWelcomeEmail } from '../services/mail.js';
+import { createOpaqueToken, hashOpaqueToken } from '../services/tokens.js';
 
 export const usersRouter = Router();
 
@@ -27,21 +24,26 @@ usersRouter.post(
       email,
       password_hash: await bcrypt.hash(password, 10),
       is_active: true,
+      // Auto-verify so login works even if SMTP is down
+      email_verified: true,
       role: email === 'ezeilodavid292@gmail.com' ? 'admin' : 'user',
       profile: { full_name: full_name || username, university: 'University Student' },
     });
     user.profile.user_id = user.id;
     await user.save();
 
-    // Issue OTP for email verification
-    await OtpToken.deleteMany({ user_id: user.id, used_at: null });
-    const otp = generateOtp();
-    await OtpToken.create({
-      otp_hash: hashOtp(otp),
-      user_id: user.id,
-      expires_at: new Date(Date.now() + 15 * 60 * 1000),
-    });
-    await sendOtpEmail(user, otp);
+    // Attempt to send verification email — non-fatal if SMTP is unavailable
+    try {
+      const token = createOpaqueToken();
+      await EmailVerificationToken.create({
+        token_hash: hashOpaqueToken(token),
+        user_id: user.id,
+        expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      });
+      await sendWelcomeEmail(user, `${env.appUrl}/confirm-email?token=${token}&email=${encodeURIComponent(user.email)}`);
+    } catch (emailErr) {
+      console.warn('[signup] Welcome email could not be sent (SMTP unavailable):', emailErr.message);
+    }
 
     res.status(201).json(await publicUser(user));
   }),
